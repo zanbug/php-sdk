@@ -1,0 +1,56 @@
+{
+    "name": "zanbug/php-sdk",
+    "description": "Zanbug error & monitoring SDK — framework-agnostic PHP core (captures exceptions, requests, auth & session).",
+    "type": "library",
+    "keywords": [
+        "zanbug",
+        "error-monitoring",
+        "error-tracking",
+        "monitoring",
+        "exceptions"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Zanbug",
+            "email": "dev@zanbug.com"
+        }
+    ],
+    "require": {
+        "php": ">=7.0",
+        "ext-json": "*"
+    },
+    "suggest": {
+        "ext-curl": "Preferred HTTP transport; without it the SDK falls back to PHP streams (needs allow_url_fopen=On)."
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^6.5 || ^7.5 || ^8.5 || ^9.5 || ^10.0"
+    },
+    "bin": [
+        "bin/zanbug"
+    ],
+    "autoload": {
+        "psr-4": {
+            "Zanbug\\Sdk\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Zanbug\\Sdk\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "homepage": "https://zanbug.com",
+    "support": {
+        "issues": "https://github.com/zanbug/php-sdk/issues",
+        "docs": "https://zanbug.com/integrations/php",
+        "source": "https://github.com/zanbug/php-sdk"
+    }
+}
