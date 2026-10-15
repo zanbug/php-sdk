@@ -1,0 +1,312 @@
+<?php
+
+namespace Zanbug\Sdk\Support;
+
+use Zanbug\Sdk\Zanbug;
+use Zanbug\Sdk\Config;
+use Zanbug\Sdk\Transport\CurlTransport;
+use Zanbug\Sdk\Transport\StreamTransport;
+use Zanbug\Sdk\Transport\Transport;
+
+/**
+ * One-time "install ping" (SDK handshake).
+ *
+ * Right after installation the SDK pings the Zanbug server ONCE so the
+ * customer immediately sees "SDK connected" in the panel. Once-only
+ * semantics are enforced by a marker file in the system temp dir; when the
+ * temp dir is not usable we still ping at most once per process. The ping
+ * is fire-and-forget: the response is ignored and this class NEVER throws.
+ */
+class Pinger
+{
+    /** @var bool Once-per-process guard (fallback when the temp marker cannot be used). */
+    private static $attempted = false;
+
+    /**
+     * Send the install ping once, if the config is usable and it was not sent before.
+     *
+     * @param Config $config
+     * @param Transport|null $transport Reuses the SDK transports when omitted.
+     * @return void
+     */
+    public static function maybePing(Config $config, $transport = null)
+    {
+        try {
+            if (self::$attempted || !$config->isUsable()) {
+                return;
+            }
+
+            $marker = self::markerPath($config);
+            if ($marker !== null && @file_exists($marker)) {
+                return;
+            }
+
+            self::$attempted = true;
+
+            if (!$transport instanceof Transport) {
+                $transport = self::defaultTransport();
+            }
+
+            // send() is fire-and-forget and never throws; response is ignored.
+            $transport->send($config->pingUrl(), $config->apiKey, self::payload($config));
+
+            if ($marker !== null) {
+                @file_put_contents($marker, (string) time());
+            }
+        } catch (\Exception $e) {
+            // The handshake must be non-fatal — stay silent no matter what.
+        } catch (\Throwable $e) {
+            // non-fatal (PHP 7+ engine errors)
+        }
+    }
+
+    /** @var string|null Absolute path of the file that called Zanbug::init(). */
+    private static $initFile = null;
+
+    /**
+     * @param string|null $file
+     * @return void
+     */
+    public static function rememberInitFile($file)
+    {
+        self::$initFile = is_string($file) && $file !== '' ? $file : null;
+    }
+
+    /**
+     * init() caller path made project-relative ("public/index.php",
+     * "bootstrap/app.php"). Falls back to the last three path segments when the
+     * project root is unknown, so no full server path leaves the machine.
+     *
+     * @return string|null
+     */
+    private static function relativeInitFile()
+    {
+        try {
+            $file = self::$initFile;
+            if ($file === null) {
+                return null;
+            }
+            $file = str_replace('\\', '/', $file);
+            $root = null;
+            if (class_exists('\\Zanbug\\Sdk\\Support\\Updater') && method_exists('\\Zanbug\\Sdk\\Support\\Updater', 'detectInstall')) {
+                $info = Updater::detectInstall();
+                if (is_array($info) && isset($info['root']) && is_string($info['root']) && $info['root'] !== '') {
+                    $root = rtrim(str_replace('\\', '/', $info['root']), '/');
+                }
+            }
+            if ($root !== null && strpos($file, $root . '/') === 0) {
+                return substr($file, strlen($root) + 1);
+            }
+            $parts = explode('/', trim($file, '/'));
+            return implode('/', array_slice($parts, -3));
+        } catch (\Exception $e) {
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Marker file path keyed by api_key + host, or null when unavailable.
+     *
+     * @param Config $config
+     * @return string|null
+     */
+    private static function markerPath(Config $config)
+    {
+        try {
+            if (!function_exists('sys_get_temp_dir')) {
+                return null;
+            }
+            $dir = @sys_get_temp_dir();
+            if (!is_string($dir) || $dir === '' || !@is_dir($dir) || !@is_writable($dir)) {
+                return null;
+            }
+            // The SDK VERSION is part of the key on purpose: after an upgrade the
+            // marker no longer matches, so the SDK pings again and the panel
+            // learns the new version. Without this an upgraded install would
+            // report its original version forever.
+            // Package versions and the auto-update switch are part of it too:
+            // an adapter upgrade or ZANBUG_AUTO_UPDATE flip re-pings as well.
+            return rtrim($dir, '/\\') . '/zanbug-ping-'
+                . md5($config->apiKey . '|' . $config->host . '|' . \Zanbug\Sdk\Zanbug::VERSION
+                    . '|' . $config->sdkName . '|' . $config->sdkPackageVersion
+                    . '|' . ($config->autoUpdate ? '1' : '0') . '|' . self::installedStamp());
+        } catch (\Exception $e) {
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Build the handshake payload (all fields optional strings, server-side).
+     *
+     * @param Config $config
+     * @return array
+     */
+    private static function payload(Config $config)
+    {
+        $payload = array(
+            'php_version' => PHP_VERSION,
+            'sdk' => $config->sdkName !== null ? $config->sdkName : 'zanbug/php-sdk',
+            'sdk_version' => Zanbug::VERSION,
+            'environment' => $config->environment,
+        );
+
+        if (function_exists('gethostname')) {
+            $hostname = @gethostname();
+            if (is_string($hostname) && $hostname !== '') {
+                $payload['hostname'] = $hostname;
+            }
+        }
+        if ($config->appName !== null) {
+            $payload['app_name'] = $config->appName;
+        }
+        if ($config->framework !== null) {
+            $payload['framework'] = $config->framework;
+        }
+        if ($config->frameworkVersion !== null) {
+            $payload['framework_version'] = $config->frameworkVersion;
+        }
+        // How the SDK was installed (composer|manual|none) and from which
+        // SAPI the ping fired. The panel uses these to tell manual installs
+        // apart from composer ones and to spot SDKs that never run in CLI.
+        // Guarded: an adapter may ship an older core without Updater.
+        $payload['sapi'] = PHP_SAPI;
+        $mode = self::installMode();
+        if ($mode !== null) {
+            $payload['install_mode'] = $mode;
+        }
+        $initFile = self::relativeInitFile();
+        if ($initFile !== null) {
+            $payload['init_file'] = $initFile;
+        }
+        // Every installed zanbug package with its version, and whether the
+        // SDK's self-update (auto_update / ZANBUG_AUTO_UPDATE) is on.
+        $packages = self::packages($config);
+        if ($packages) {
+            $payload['packages'] = $packages;
+        }
+        $payload['auto_update'] = (bool) $config->autoUpdate;
+        $payload['auto_update_supported'] = true;
+
+        return $payload;
+    }
+
+    /**
+     * mtime of composer's installed.json (changes on every composer
+     * install/update) — cheap enough for the per-request marker check,
+     * unlike parsing the file.
+     *
+     * @return string
+     */
+    private static function installedStamp()
+    {
+        try {
+            $vendor = self::vendorDir();
+            if ($vendor !== null) {
+                $t = @filemtime($vendor . '/composer/installed.json');
+                return $t ? (string) $t : '';
+            }
+        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+        }
+
+        return '';
+    }
+
+    /**
+     * @return string|null vendor/ dir when installed with composer
+     */
+    private static function vendorDir()
+    {
+        if (class_exists('\\Zanbug\\Sdk\\Support\\Updater') && method_exists('\\Zanbug\\Sdk\\Support\\Updater', 'detectInstall')) {
+            $info = Updater::detectInstall();
+            if (isset($info['mode'], $info['vendor']) && $info['mode'] === 'composer' && is_string($info['vendor'])) {
+                return $info['vendor'];
+            }
+        }
+
+        return null;
+    }
+
+    /** @var array|null Per-process cache of packages(). */
+    private static $packages = null;
+
+    /**
+     * {"zanbug/php-sdk": "1.7.4", "zanbug/laravel": "1.7.4"} — composer's
+     * installed.json when installed with composer; otherwise the core's own
+     * VERSION plus the adapter that initialised it (it passes its version).
+     *
+     * @param Config $config
+     * @return array
+     */
+    private static function packages(Config $config)
+    {
+        if (self::$packages !== null) {
+            return self::$packages;
+        }
+        $out = array();
+        try {
+            $vendor = self::vendorDir();
+            if ($vendor !== null) {
+                $data = json_decode((string) @file_get_contents($vendor . '/composer/installed.json'), true);
+                $list = is_array($data) && isset($data['packages']) && is_array($data['packages']) ? $data['packages'] : $data; // composer 2 vs 1
+                if (is_array($list)) {
+                    foreach ($list as $pkg) {
+                        if (!is_array($pkg) || !isset($pkg['name']) || strpos((string) $pkg['name'], 'zanbug/') !== 0) {
+                            continue;
+                        }
+                        $v = isset($pkg['version']) ? ltrim((string) $pkg['version'], 'v') : '?';
+                        $out[(string) $pkg['name']] = $v;
+                    }
+                }
+            }
+            // Always true for the code that is actually running (a path repo or
+            // a dev branch shows up in installed.json as "dev-main").
+            $out['zanbug/php-sdk'] = Zanbug::VERSION;
+            if ($config->sdkName !== null && $config->sdkName !== 'zanbug/php-sdk'
+                && (!isset($out[$config->sdkName]) || $config->sdkPackageVersion !== null)) {
+                $out[$config->sdkName] = $config->sdkPackageVersion !== null ? $config->sdkPackageVersion : '?';
+            }
+            ksort($out);
+        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+        }
+        self::$packages = $out;
+
+        return $out;
+    }
+
+    /**
+     * @return string|null composer|manual|none, null when it cannot be told
+     */
+    private static function installMode()
+    {
+        try {
+            if (!class_exists('\\Zanbug\\Sdk\\Support\\Updater') || !method_exists('\\Zanbug\\Sdk\\Support\\Updater', 'detectInstall')) {
+                return null;
+            }
+            $info = Updater::detectInstall();
+            return isset($info['mode']) && is_string($info['mode']) ? $info['mode'] : null;
+        } catch (\Exception $e) {
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Same transport choice as the Client, but capped at a 3s timeout.
+     *
+     * @return Transport
+     */
+    private static function defaultTransport()
+    {
+        if (extension_loaded('curl')) {
+            return new CurlTransport(3);
+        }
+        return new StreamTransport(3);
+    }
+}
