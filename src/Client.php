@@ -1,0 +1,1549 @@
+<?php
+
+namespace Zanbug\Sdk;
+
+use Zanbug\Sdk\Support\Breadcrumbs;
+use Zanbug\Sdk\Support\QueryTester;
+use Zanbug\Sdk\Support\CallerFinder;
+use Zanbug\Sdk\Support\Compat;
+use Zanbug\Sdk\Support\ExplainParser;
+use Zanbug\Sdk\Support\ContextCollector;
+use Zanbug\Sdk\Support\LaravelAuth;
+use Zanbug\Sdk\Support\LaravelRoute;
+use Zanbug\Sdk\Support\YiiAuth;
+use Zanbug\Sdk\Support\RunTracker;
+use Zanbug\Sdk\Support\StacktraceBuilder;
+use Zanbug\Sdk\Transport\CurlTransport;
+use Zanbug\Sdk\Transport\StreamTransport;
+use Zanbug\Sdk\Transport\Transport;
+
+class Client
+{
+    /** Max buffered slow-query rows per process/request (server accepts 50 per POST). */
+    const MAX_QUERY_BUFFER = 25;
+    /** Max SQL text length sent per query row. */
+    const MAX_SQL_LENGTH = 10000;
+    /** Max bindings kept per query row. */
+    const MAX_BINDINGS = 30;
+    /** Max characters kept per string binding. */
+    const MAX_BINDING_LENGTH = 200;
+
+    /** @var Config */
+    private $config;
+    /** @var Transport */
+    private $transport;
+    /** @var Breadcrumbs */
+    private $breadcrumbs;
+    /** @var ContextCollector */
+    private $collector;
+    /** @var array|null */
+    private $user = null;
+    /** @var array */
+    private $extraContext = array();
+    /** @var array Buffered telemetry payloads (each: array('url' => string, 'payload' => array)) */
+    private $queue = array();
+    /** @var array Buffered slow-query rows, batched into ONE POST at shutdown. */
+    private $queries = array();
+    /** @var bool Guard so only ONE shutdown function is ever registered per client. */
+    private $shutdownRegistered = false;
+    /** @var bool True once the shutdown flush has begun; later captures then send inline. */
+    private $shutdownStarted = false;
+    /**
+     * Adapter-supplied closure that executes a read-only statement on the
+     * application's OWN connection and returns the row count. Without one,
+     * query tests silently do nothing — which is the state of any app that has
+     * not wired an adapter.
+     * @var callable|null
+     */
+    private $queryRunner = null;
+    /** @var bool One test per process; a request must not become a test loop. */
+    private $testChecked = false;
+    /** @var array|null Web only: who made this request (user + user agent), resolved once. */
+    private $who = null;
+    /** @var bool True while resolving $who — the auth lookup may itself run queries. */
+    private $resolvingWho = false;
+    /** @var callable|null Adapter-registered "who is logged in" lookup (framework auth). */
+    private $userResolver = null;
+    /** @var bool True once a request row was logged this request (adapter OR audit) — dedup guard. */
+    private $requestLogged = false;
+    /** @var bool Guard so the audit shutdown function is registered at most once. */
+    private $auditRegistered = false;
+    /** @var bool Re-entrancy guard: the auth lookup may itself run queries or throw. */
+    private $resolvingUser = false;
+
+    /** @var RunTracker|null CLI only: one record per process / queue job. */
+    private $runTracker = null;
+
+    /** Seconds between test polls, app-wide. Keeps the feature ~free. */
+    const TEST_POLL_SECONDS = 20;
+
+    /** Upper bound on EXPLAINs the core runs itself, per process per minute. */
+    const MAX_AUTO_EXPLAINS_PER_MINUTE = 20;
+    /** @var bool True while the core's own EXPLAIN runs — it re-enters query listeners. */
+    private static $explaining = false;
+    /** @var int */
+    private $explainWindowStart = 0;
+    /** @var int */
+    private $explainCount = 0;
+
+    public function __construct(Config $config, $transport = null)
+    {
+        $this->config = $config;
+        $this->transport = $transport instanceof Transport ? $transport : self::defaultTransport($config->timeout);
+        $this->breadcrumbs = new Breadcrumbs();
+        $this->collector = new ContextCollector($config->redact);
+        // Background work (cron, queue, console) gets a per-run record so the
+        // panel can say which command loads the server. Never for web requests.
+        $this->runTracker = RunTracker::start($config, $this->transport);
+        if ($this->runTracker === null && PHP_SAPI === 'cli' && $config->captureRuns) {
+            $this->runTracker = RunTracker::current();
+        }
+        // Universal "who did it": on web SAPIs, arrange to emit one audit row for
+        // an authenticated state-changing request AFTER the response is flushed.
+        $this->registerAuditShutdown();
+    }
+
+    /**
+     * Register EXACTLY ONE shutdown function (guarded) that, on a web SAPI with
+     * audit enabled, records the actor behind a state-changing request. It runs
+     * for every request — the method/auth gate lives in maybeEmitAudit(), so a
+     * request that does not qualify costs nothing but the guard checks.
+     */
+    private function registerAuditShutdown()
+    {
+        if ($this->auditRegistered) {
+            return;
+        }
+        if (PHP_SAPI === 'cli' || !$this->config->captureAudit || !$this->config->isUsable()) {
+            return;
+        }
+        $this->auditRegistered = true;
+        $self = $this;
+        register_shutdown_function(function () use ($self) {
+            $self->maybeEmitAudit();
+        });
+    }
+
+    /**
+     * Emit ONE audit request-log row when this web request changed state and a
+     * logged-in actor made it. Public because it is invoked from the registered
+     * shutdown closure. Never throws.
+     *
+     * Deduplication: if an adapter already logged this request via
+     * captureRequest() (full traffic logging with capture_requests on), that row
+     * already carries the actor, so we skip to avoid a duplicate.
+     */
+    public function maybeEmitAudit()
+    {
+        try {
+            if (!$this->config->isUsable() || !$this->config->captureAudit) {
+                return;
+            }
+            if ($this->requestLogged || PHP_SAPI === 'cli') {
+                return;
+            }
+            $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : '';
+            if (!in_array($method, array('POST', 'PUT', 'PATCH', 'DELETE'), true)) {
+                return;
+            }
+            // Resolve the actor (also gives us IP). Only authenticated actors are
+            // audited — anonymous POSTs (login failures, public forms, bots) are
+            // not "who did it" data and would only add noise.
+            $who = $this->requestWho();
+            if (empty($who['user']) || !is_array($who['user'])) {
+                return;
+            }
+            $path = null;
+            if (!empty($_SERVER['REQUEST_URI'])) {
+                $path = strtok((string) $_SERVER['REQUEST_URI'], '?');
+            }
+            if ($path === null || $path === '') {
+                return;
+            }
+            $status = null;
+            if (function_exists('http_response_code')) {
+                $code = http_response_code();
+                if (is_int($code) && $code >= 100 && $code <= 599) {
+                    $status = $code;
+                }
+            }
+            $meta = array('user' => $who['user'], 'audit' => true, 'source' => 'php');
+            if (!empty($who['user_agent'])) {
+                $meta['user_agent'] = $who['user_agent'];
+            }
+            $row = array(
+                'method' => $method,
+                'path' => substr($path, 0, 255),
+                'status_code' => $status,
+                'occurred_at' => gmdate('c'),
+                'meta' => $meta,
+            );
+            if (!empty($who['ip'])) {
+                $row['ip'] = $who['ip'];
+            }
+            $this->captureRequest(array('requests' => array($row)));
+        } catch (\Exception $e) {
+            // Telemetry must be non-fatal.
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /**
+     * Pick the best available transport: cURL if present, otherwise PHP streams.
+     */
+    private static function defaultTransport($timeout)
+    {
+        if (extension_loaded('curl')) {
+            return new CurlTransport($timeout);
+        }
+        return new StreamTransport($timeout);
+    }
+
+    public function config()
+    {
+        return $this->config;
+    }
+
+    public function breadcrumbs()
+    {
+        return $this->breadcrumbs;
+    }
+
+    public function setUser(array $user)
+    {
+        $this->user = $user;
+        return $this;
+    }
+
+    /**
+     * Framework adapters register how to find the logged-in user, so nobody
+     * has to call setUser() by hand. A manual setUser() still wins.
+     *
+     * @param callable|null $resolver returns array('id','email','name','guard') or null
+     */
+    public function setUserResolver($resolver)
+    {
+        $this->userResolver = is_callable($resolver) ? $resolver : null;
+        return $this;
+    }
+
+    /**
+     * The user for this event: manual setUser() > adapter resolver > a
+     * best-effort look at an already-started PHP session. Never throws.
+     *
+     * @return array|null
+     */
+    private function autoUser()
+    {
+        if (!empty($this->user)) {
+            return $this->user;
+        }
+        if (!$this->config->autoUser || $this->resolvingUser) {
+            return null;
+        }
+        $this->resolvingUser = true;
+        $user = null;
+        try {
+            if ($this->userResolver !== null) {
+                $user = call_user_func($this->userResolver);
+            }
+        } catch (\Exception $e) {
+            $user = null;
+        } catch (\Throwable $e) {
+            $user = null;
+        }
+        // Manual Laravel install (no adapter): ask the running container.
+        if (empty($user) || !is_array($user)) {
+            try {
+                $user = LaravelAuth::user();
+            } catch (\Exception $e) {
+                $user = null;
+            } catch (\Throwable $e) {
+                $user = null;
+            }
+        }
+        // Manual Yii2 install (no zanbug/yii2 extension): ask Yii::$app.
+        if (empty($user) || !is_array($user)) {
+            try {
+                $user = YiiAuth::user();
+            } catch (\Exception $e) {
+                $user = null;
+            } catch (\Throwable $e) {
+                $user = null;
+            }
+        }
+        // A failing adapter lookup must not also lose the plain-session user.
+        if (empty($user) || !is_array($user)) {
+            try {
+                $user = ContextCollector::sessionUser();
+            } catch (\Exception $e) {
+                $user = null;
+            } catch (\Throwable $e) {
+                $user = null;
+            }
+        }
+        $this->resolvingUser = false;
+        return (is_array($user) && !empty($user)) ? $user : null;
+    }
+
+    public function setContext($key, $value)
+    {
+        $this->extraContext[$key] = $value;
+        return $this;
+    }
+
+    public function addBreadcrumb($message, $category = 'default', array $data = array(), $level = 'info')
+    {
+        $this->breadcrumbs->add($message, $category, $data, $level);
+        return $this;
+    }
+
+    /**
+     * Report a caught throwable/exception.
+     *
+     * @param \Throwable|\Exception $e
+     */
+    public function capture($e, array $extra = array())
+    {
+        if (!$this->config->isUsable() || !$this->shouldSample()) {
+            return;
+        }
+
+        $handled = self::takeHandled($extra, true);
+        $this->rememberCaptured($e);
+        $ctx = $this->collectContext();
+        $payload = array(
+            'type' => 'error',
+            'exception_class' => get_class($e),
+            'message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+            'level' => 'error',
+            'handled' => $handled,
+            'release' => $this->config->release,
+            'environment' => $this->config->environment,
+            'stacktrace' => StacktraceBuilder::fromThrowable($e, $this->config->codeContextLines, $this->config->codeFullFunction),
+            'request' => $ctx['request'],
+            'session' => $ctx['session'],
+            'user' => $ctx['user'],
+            'device' => Compat::runtime(),
+            'breadcrumbs' => $this->breadcrumbs->all(),
+            'context' => array_merge($this->extraContext, $ctx['context'], $extra),
+        );
+
+        $this->dispatch($payload);
+    }
+
+    /** @var array signature => unix time of throwables reported via capture() */
+    private $recentCaptures = array();
+
+    /**
+     * @param \Throwable|\Exception $e
+     * @return void
+     */
+    private function rememberCaptured($e)
+    {
+        $now = time();
+        foreach ($this->recentCaptures as $sig => $at) {
+            if ($now - $at > 60) {
+                unset($this->recentCaptures[$sig]);
+            }
+        }
+        if (count($this->recentCaptures) >= 20) {
+            array_shift($this->recentCaptures);
+        }
+        // Same layout as PHP's Exception::__toString() ("Class in file:line" when the message is empty).
+        $msg = (string) $e->getMessage();
+        $sig = get_class($e) . ($msg === '' ? '' : ': ' . $msg) . ' in ' . $e->getFile() . ':' . $e->getLine();
+        $this->recentCaptures[$sig] = $now;
+    }
+
+    /**
+     * True when $message is the string form ("Class: msg in file:line ...") of a
+     * throwable captured in the last minute.
+     *
+     * @param string $message
+     * @return bool
+     */
+    private function wasJustCaptured($message)
+    {
+        if (empty($this->recentCaptures) || !is_string($message)) {
+            return false;
+        }
+        $now = time();
+        foreach ($this->recentCaptures as $sig => $at) {
+            if ($now - $at <= 60 && strpos($message, $sig) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Report a throwable that nobody caught: it reached the framework's error
+     * handler, the global exception handler, or the shutdown function.
+     *
+     * Same payload as capture() but `handled=false`, which is what the panel's
+     * "Unhandled" view filters on (Bugsnag semantics: automatically captured =
+     * unhandled, explicit capture() = handled). Adapters MUST guard this call
+     * with method_exists() — a newer adapter over an older core must degrade to
+     * capture(), never fatal (v1.5.2 lesson).
+     *
+     * @param \Throwable|\Exception $e
+     */
+    public function captureUnhandled($e, array $extra = array())
+    {
+        $extra['handled'] = false;
+        $this->capture($e, $extra);
+    }
+
+    /**
+     * Pull the optional `handled` flag out of $extra so it never leaks into the
+     * context block. Returns the flag (default when absent).
+     *
+     * @param array $extra (by reference)
+     * @param bool $default
+     * @return bool
+     */
+    private static function takeHandled(array &$extra, $default)
+    {
+        $handled = $default;
+        if (array_key_exists('handled', $extra)) {
+            $handled = (bool) $extra['handled'];
+            unset($extra['handled']);
+        }
+        return $handled;
+    }
+
+    /**
+     * Report a message / non-exception event (also used by error & shutdown handlers).
+     */
+    public function captureMessage($message, $level = 'info', array $extra = array())
+    {
+        if (!$this->config->isUsable() || !$this->shouldSample()) {
+            return;
+        }
+
+        $handled = self::takeHandled($extra, true);
+        $ctx = $this->collectContext();
+        $payload = array(
+            'type' => 'log',
+            'exception_class' => null,
+            'message' => $message,
+            'file' => isset($extra['file']) ? $extra['file'] : null,
+            'line' => isset($extra['line']) ? $extra['line'] : null,
+            'level' => $level,
+            'handled' => $handled,
+            'release' => $this->config->release,
+            'environment' => $this->config->environment,
+            'stacktrace' => null,
+            'request' => $ctx['request'],
+            'session' => $ctx['session'],
+            'user' => $ctx['user'],
+            'device' => Compat::runtime(),
+            'breadcrumbs' => $this->breadcrumbs->all(),
+            'context' => array_merge($this->extraContext, $ctx['context'], $extra),
+        );
+
+        $this->dispatch($payload);
+    }
+
+    /**
+     * PSR log-level severity ranking (higher = more severe). Unknown levels are
+     * treated as 'error' so they are never silently dropped by the threshold.
+     *
+     * @param mixed $level
+     * @return int
+     */
+    private static function levelSeverity($level)
+    {
+        $map = array(
+            'debug' => 0,
+            'info' => 1,
+            'notice' => 2,
+            'warning' => 3,
+            'error' => 4,
+            'critical' => 5,
+            'alert' => 6,
+            'emergency' => 7,
+        );
+        $level = is_string($level) ? strtolower($level) : 'error';
+        return isset($map[$level]) ? $map[$level] : 4;
+    }
+
+    /**
+     * Forward a log record (Log::error, caught-and-logged error, etc.) as a handled
+     * event through the SAME buffered/shutdown delivery path events use.
+     *
+     * No-op unless the config is usable, capture_logs is on and $level is at/above the
+     * configured log_level. When $context['exception'] is a Throwable, its class/file/line
+     * and a full stacktrace are used; otherwise a synthetic 'Log' class with a caller
+     * frame + lightweight backtrace is built. The context is redacted (password/token/
+     * secret/authorization/...) and the raw Throwable is replaced by its class/message.
+     * NEVER throws.
+     *
+     * @param string $level   PSR level.
+     * @param string $message Log message.
+     * @param array  $context Monolog context.
+     * @return void
+     */
+    public function recordLogEvent($level, $message, array $context = array())
+    {
+        try {
+            if (!$this->config->isUsable() || !$this->config->captureLogs) {
+                return;
+            }
+            $level = is_string($level) ? strtolower($level) : 'error';
+            if (self::levelSeverity($level) < self::levelSeverity($this->config->logLevel)) {
+                return;
+            }
+            if (!$this->shouldSample()) {
+                return;
+            }
+
+            $message = is_string($message) ? $message : $this->stringifyMessage($message);
+
+            // Log::error($e) with the exception as the MESSAGE (not in context) right after
+            // Zanbug::capture($e): the same throwable would arrive twice (once as error, once
+            // as a "Log" line with its string form). Skip the log copy.
+            if ($this->wasJustCaptured($message)) {
+                return;
+            }
+
+            $throwable = isset($context['exception']) ? $context['exception'] : null;
+            $isThrowable = ($throwable instanceof \Throwable || $throwable instanceof \Exception);
+
+            $excClass = 'Log';
+            $file = null;
+            $line = null;
+            $stacktrace = null;
+
+            if ($isThrowable) {
+                $excClass = get_class($throwable);
+                $file = $throwable->getFile();
+                $line = $throwable->getLine();
+                $stacktrace = StacktraceBuilder::fromThrowable(
+                    $throwable,
+                    $this->config->codeContextLines,
+                    $this->config->codeFullFunction
+                );
+                if ($message === '') {
+                    $message = $throwable->getMessage();
+                }
+            } else {
+                $caller = CallerFinder::find();
+                if ($caller !== null) {
+                    $file = $caller['file'];
+                    $line = $caller['line'];
+                }
+                $stacktrace = $this->lightweightBacktrace();
+            }
+
+            $ctx = $this->collectContext();
+            $payload = array(
+                'type' => 'log',
+                'exception_class' => $excClass,
+                'message' => $message,
+                'file' => $file,
+                'line' => $line,
+                'level' => $level,
+                'handled' => true,
+                'release' => $this->config->release,
+                'environment' => $this->config->environment,
+                'stacktrace' => $stacktrace,
+                'request' => $ctx['request'],
+                'session' => $ctx['session'],
+                'user' => $ctx['user'],
+                'device' => Compat::runtime(),
+                'breadcrumbs' => $this->breadcrumbs->all(),
+                'context' => array_merge($this->extraContext, $ctx['context'], $this->sanitizeLogContext($context)),
+            );
+
+            $this->dispatch($payload);
+        } catch (\Exception $e) {
+            // Telemetry must be non-fatal.
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /**
+     * Best-effort string form of a non-string log message (Throwable/stringable/other).
+     *
+     * @param mixed $message
+     * @return string
+     */
+    private function stringifyMessage($message)
+    {
+        if (is_string($message)) {
+            return $message;
+        }
+        if ($message instanceof \Throwable || $message instanceof \Exception) {
+            return $message->getMessage();
+        }
+        if (is_scalar($message) || $message === null) {
+            return (string) $message;
+        }
+        if (is_object($message) && method_exists($message, '__toString')) {
+            return (string) $message;
+        }
+        return is_object($message) ? '[object ' . get_class($message) . ']' : '[' . gettype($message) . ']';
+    }
+
+    /**
+     * Redact a log context array for transport: strip configured secret keys, replace a
+     * raw 'exception' Throwable with its class/message, and reduce other objects to a
+     * light placeholder so serialization stays safe. Never throws.
+     *
+     * @param array $context
+     * @return array
+     */
+    private function sanitizeLogContext(array $context)
+    {
+        $out = array();
+        foreach ($context as $k => $v) {
+            if ($k === 'exception' && ($v instanceof \Throwable || $v instanceof \Exception)) {
+                $out[$k] = array(
+                    'class' => get_class($v),
+                    'message' => $v->getMessage(),
+                );
+            } elseif (is_object($v)) {
+                if ($v instanceof \DateTimeInterface) {
+                    $out[$k] = $v->format('Y-m-d H:i:s');
+                } elseif (method_exists($v, '__toString')) {
+                    $out[$k] = (string) $v;
+                } else {
+                    $out[$k] = '[object ' . get_class($v) . ']';
+                }
+            } else {
+                $out[$k] = $v;
+            }
+        }
+        return $this->collector->redactArray($out);
+    }
+
+    /**
+     * A lightweight call stack for synthetic ('Log') events: the frames leading to the
+     * log call, excluding the SDK's own src/ frames. No source-code capture — just
+     * file/line/function/class/type. Never throws.
+     *
+     * @return array<int, array<string, mixed>>|null
+     */
+    private function lightweightBacktrace()
+    {
+        try {
+            $sdkDir = str_replace('\\', '/', __DIR__); // src/
+            $frames = array();
+            $bt = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 50);
+            foreach ($bt as $t) {
+                $file = isset($t['file']) && is_string($t['file']) ? str_replace('\\', '/', $t['file']) : null;
+                if ($file !== null && strpos($file, $sdkDir . '/') === 0) {
+                    continue; // inside the SDK itself
+                }
+                $frames[] = array(
+                    'file' => isset($t['file']) ? $t['file'] : '[internal]',
+                    'line' => isset($t['line']) ? (int) $t['line'] : null,
+                    'function' => isset($t['function']) ? $t['function'] : null,
+                    'class' => isset($t['class']) ? $t['class'] : null,
+                    'type' => isset($t['type']) ? $t['type'] : null,
+                );
+                if (count($frames) >= 30) {
+                    break;
+                }
+            }
+            return count($frames) > 0 ? $frames : null;
+        } catch (\Exception $e) {
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Send a request/performance log.
+     */
+    public function captureRequest(array $data)
+    {
+        if (!$this->config->isUsable()) {
+            return;
+        }
+        // Mark the request as logged so the audit shutdown does not add a
+        // duplicate row for the same request.
+        $this->requestLogged = true;
+        $this->emit($this->config->requestsUrl(), $data);
+    }
+
+    /**
+     * Record a database query for slow-query (performance) monitoring.
+     *
+     * Queries faster than Config::$slowQueryMs are ignored. Slow ones are
+     * buffered (max MAX_QUERY_BUFFER per process/request) and batched into a
+     * single non-blocking POST at shutdown — the same deferred mechanism
+     * events use. NEVER throws; silent no-op when the config is not usable
+     * or capture_queries is disabled.
+     *
+     * @param string $sql        Raw SQL text (any driver — MySQL, PostgreSQL, SQLite...).
+     * @param float|int $durationMs Query duration in MILLISECONDS.
+     * @param array  $meta       Optional: connection, bindings, file, line.
+     * @return void
+     */
+    public function recordQuery($sql, $durationMs, array $meta = array())
+    {
+        try {
+            if (!$this->config->isUsable() || !$this->config->captureQueries || $this->resolvingWho) {
+                return;
+            }
+            // The EXPLAIN below goes through the app's own connection, so its
+            // DB::listen / profiler hooks call back in here — ignore that echo.
+            if (self::$explaining) {
+                return;
+            }
+            if (!is_string($sql)) {
+                if (is_object($sql) && method_exists($sql, '__toString')) {
+                    $sql = (string) $sql;
+                } else {
+                    return;
+                }
+            }
+            $sql = trim($sql);
+            if ($sql === '' || !is_numeric($durationMs)) {
+                return;
+            }
+            $durationMs = (float) $durationMs;
+            $isSlow = $durationMs >= $this->config->slowQueryMs;
+            if ($this->runTracker) {
+                // Every query counts toward the run's totals — the slow filter below
+                // only decides which ones are reported individually.
+                $this->runTracker->countQuery($durationMs, $isSlow);
+            }
+            if (!$isSlow) {
+                return;
+            }
+            if (count($this->queries) >= self::MAX_QUERY_BUFFER) {
+                return;
+            }
+
+            $row = array(
+                'sql' => strlen($sql) > self::MAX_SQL_LENGTH
+                    ? substr($sql, 0, self::MAX_SQL_LENGTH) . '...[truncated]'
+                    : $sql,
+                'duration_ms' => round($durationMs, 2),
+                'occurred_at' => gmdate('Y-m-d\TH:i:s\Z'),
+            );
+
+            if (isset($meta['connection']) && is_string($meta['connection']) && $meta['connection'] !== '') {
+                $row['connection'] = $meta['connection'];
+            }
+            if (isset($meta['bindings']) && is_array($meta['bindings']) && !empty($meta['bindings'])) {
+                $row['bindings'] = $this->sanitizeBindings($meta['bindings']);
+            }
+
+            // Optional EXPLAIN / index-usage result, produced by the Laravel
+            // adapter or TracedPdo (via ExplainParser). Forwarded as-is; the
+            // server flags full-table-scans from it. Callers of the core may
+            // also pass their own meta['explain'] for other frameworks.
+            if (isset($meta['explain']) && is_array($meta['explain']) && !empty($meta['explain'])) {
+                $row['explain'] = $meta['explain'];
+            } elseif (empty($meta['explain_tried'])) {
+                // Hand-written Zanbug::recordQuery() calls (a DB::listen in the
+                // app, a CI/Yii/Symfony hook) carry no plan, so the panel could
+                // never say whether an index was used. Ask the database here.
+                $explain = $this->autoExplain(
+                    $sql,
+                    (isset($meta['bindings']) && is_array($meta['bindings'])) ? $meta['bindings'] : array(),
+                    isset($meta['connection']) && is_string($meta['connection']) ? $meta['connection'] : null,
+                    isset($meta['pdo']) ? $meta['pdo'] : null
+                );
+                if (is_array($explain) && !empty($explain)) {
+                    $row['explain'] = $explain;
+                }
+            }
+
+            // Caller: explicit meta wins; otherwise first stack frame outside
+            // vendor/ and outside the SDK itself.
+            if (isset($meta['file']) && is_string($meta['file']) && $meta['file'] !== '') {
+                $row['file'] = $meta['file'];
+                if (isset($meta['line']) && is_numeric($meta['line'])) {
+                    $row['line'] = (int) $meta['line'];
+                }
+            } else {
+                $found = CallerFinder::locate();
+                $caller = $found['caller'];
+                if ($caller !== null) {
+                    $row['file'] = $caller['file'];
+                    if ($caller['line'] !== null) {
+                        $row['line'] = $caller['line'];
+                    }
+                }
+                // The app's call chain (innermost first): with a DB::listen hook or
+                // a shared repository the top frame alone does not say which
+                // command/controller ran the query.
+                if (count($found['trace']) > 1) {
+                    $row['trace'] = $found['trace'];
+                }
+            }
+
+            // Request context (web SAPIs only).
+            if (PHP_SAPI !== 'cli') {
+                if (!empty($_SERVER['REQUEST_URI'])) {
+                    $row['url'] = (string) $_SERVER['REQUEST_URI'];
+                }
+                if (!empty($_SERVER['REQUEST_METHOD'])) {
+                    $row['method'] = (string) $_SERVER['REQUEST_METHOD'];
+                }
+                // Actor context is captured HERE, mid-request, while $_SERVER and
+                // the auth guard are still warm. Deferring the whole "who" to the
+                // shutdown flush lost the user agent, IP and user on some setups
+                // (closed session / multi-guard), because the flush re-resolves
+                // after the request has torn down. User agent and IP come straight
+                // from the live request; the user is resolved (and cached) now so
+                // the shutdown flush reuses the warm result.
+                if (!empty($_SERVER['HTTP_USER_AGENT'])) {
+                    $row['user_agent'] = substr((string) $_SERVER['HTTP_USER_AGENT'], 0, 300);
+                }
+                $requestIp = $this->requestIp();
+                if ($requestIp !== null) {
+                    $row['ip'] = $requestIp;
+                }
+                $who = $this->requestWho();
+                if (!empty($who['user'])) {
+                    $row['user'] = $who['user'];
+                }
+                // Which route/controller ran it — the URL alone does not say
+                // which Controller@method built the query.
+                $route = LaravelRoute::current();
+                if ($route !== null) {
+                    $row['route'] = $route;
+                }
+            } elseif ($this->runTracker) {
+                // Background work: which command / cron / queue job ran this query,
+                // so the panel can group by process instead of by URL.
+                foreach ($this->runTracker->context() as $k => $v) {
+                    if ($v !== null && $v !== '') {
+                        $row[$k] = $v;
+                    }
+                }
+            }
+
+            if ($this->shutdownStarted) {
+                // Shutdown flush already ran — deliver inline so nothing is lost.
+                $this->sendOne($this->config->queriesUrl(), array('queries' => $this->attachWho(array($row))));
+                return;
+            }
+
+            $this->queries[] = $row;
+            $this->registerShutdownFlush();
+        } catch (\Exception $e) {
+            // Telemetry must be non-fatal.
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /**
+     * Positional bindings, made safe to serialize: capped count, scalars only,
+     * long strings truncated. Objects/arrays are replaced with placeholders.
+     *
+     * @param array $bindings
+     * @return array
+     */
+    private function sanitizeBindings(array $bindings)
+    {
+        $out = array();
+        $count = 0;
+        foreach ($bindings as $value) {
+            if ($count >= self::MAX_BINDINGS) {
+                $out[] = '...[' . (count($bindings) - self::MAX_BINDINGS) . ' more]';
+                break;
+            }
+            $count++;
+            if (is_string($value)) {
+                $out[] = strlen($value) > self::MAX_BINDING_LENGTH
+                    ? substr($value, 0, self::MAX_BINDING_LENGTH) . '...[truncated]'
+                    : $value;
+            } elseif (is_scalar($value) || $value === null) {
+                $out[] = $value;
+            } elseif (is_object($value)) {
+                if ($value instanceof \DateTimeInterface) {
+                    $out[] = $value->format('Y-m-d H:i:s');
+                } else {
+                    $out[] = '[object ' . get_class($value) . ']';
+                }
+            } elseif (is_array($value)) {
+                $out[] = '[array:' . count($value) . ']';
+            } else {
+                $out[] = '[resource]';
+            }
+        }
+        return $out;
+    }
+
+    private function dispatch(array $payload)
+    {
+        if (is_callable($this->config->beforeSend)) {
+            $payload = call_user_func($this->config->beforeSend, $payload);
+            if (!is_array($payload)) {
+                return;
+            }
+        }
+        $this->emit($this->config->eventsUrl(), $payload);
+    }
+
+    /**
+     * Either buffer the payload for a non-blocking shutdown flush (web SAPI, deferred),
+     * or send it inline (CLI, flag off, or when we are already flushing at shutdown).
+     */
+    private function emit($url, array $payload)
+    {
+        $deferred = $this->config->sendOnShutdown && !$this->shutdownStarted;
+        if ($deferred) {
+            $this->queue[] = array('url' => $url, 'payload' => $payload);
+            $this->registerShutdownFlush();
+            return;
+        }
+        $this->sendOne($url, $payload);
+    }
+
+    /**
+     * Register EXACTLY ONE shutdown function (guarded) that flushes the buffered queue
+     * AFTER the HTTP response has been handed back to the end user.
+     */
+    private function registerShutdownFlush()
+    {
+        if ($this->shutdownRegistered) {
+            return;
+        }
+        $this->shutdownRegistered = true;
+        $self = $this;
+        register_shutdown_function(function () use ($self) {
+            $self->runShutdownFlush();
+        });
+    }
+
+    /**
+     * Shutdown handler: flush the response to the user first (PHP-FPM / LiteSpeed),
+     * then deliver the buffered telemetry. Public because it is invoked from the
+     * registered shutdown closure. Never throws.
+     */
+    public function runShutdownFlush()
+    {
+        // From now on, any freshly-captured events (e.g. a fatal caught by the SDK's own
+        // shutdown handler that runs after this one) send inline instead of buffering.
+        $this->shutdownStarted = true;
+
+        // Hand the response back to the end user BEFORE we spend time on HTTP sends,
+        // so telemetry adds zero perceived latency under PHP-FPM.
+        if (function_exists('fastcgi_finish_request')) {
+            try {
+                fastcgi_finish_request();
+            } catch (\Exception $e) {
+                // non-fatal
+            } catch (\Throwable $e) {
+                // non-fatal
+            }
+        } elseif (function_exists('litespeed_finish_request')) {
+            try {
+                litespeed_finish_request();
+            } catch (\Exception $e) {
+                // non-fatal
+            } catch (\Throwable $e) {
+                // non-fatal
+            }
+        }
+
+        $this->flushQueue();
+    }
+
+    /**
+     * Force-send any buffered telemetry immediately. Useful for CLI, tests and
+     * queue workers that want deterministic, synchronous delivery.
+     */
+    public function flush()
+    {
+        $this->flushQueue();
+    }
+
+    /**
+     * Register the closure that runs a test statement. Called by the framework
+     * adapter (or by the app itself for a composer-less install).
+     *
+     * @param callable $runner function(string $sql, array $bindings): int
+     * @return void
+     */
+    // ---- Background-process attribution (CLI only) ----------------------
+
+    /** @return RunTracker|null */
+    public function runTracker()
+    {
+        return $this->runTracker;
+    }
+
+    /**
+     * Override the auto-detected command name (e.g. the adapter knows the
+     * artisan command that is really running).
+     */
+    public function setCommand($name)
+    {
+        if ($this->runTracker) {
+            $this->runTracker->setCommand($name);
+        }
+    }
+
+    /** @param string $source cron|scheduler|queue|artisan|script */
+    public function setRunSource($source)
+    {
+        if ($this->runTracker) {
+            $this->runTracker->setSource($source);
+        }
+    }
+
+    /** Exit code of the process run (adapters know it before shutdown). */
+    public function setExitCode($code)
+    {
+        if ($this->runTracker) {
+            $this->runTracker->setExitCode($code);
+        }
+    }
+
+    /**
+     * A long-lived worker starts one unit of work (queue job, message,
+     * scheduled task). Everything until endJob() is attributed to it.
+     */
+    public function beginJob($class, array $meta = array(), $source = 'queue')
+    {
+        if ($this->runTracker) {
+            $this->runTracker->beginJob($class, $meta, $source);
+        }
+    }
+
+    /**
+     * Unit of work finished. Also flushes buffered slow queries: a worker may
+     * live for days and shutdown flush would hold them until then.
+     */
+    public function endJob($exitCode = 0, $error = null)
+    {
+        if ($this->runTracker) {
+            $this->runTracker->endJob($exitCode, $error);
+        }
+        if (!empty($this->queries)) {
+            $this->flush();
+        }
+    }
+
+    /**
+     * EXPLAIN a slow SELECT that arrived without a plan. Sources, first that
+     * works: meta['pdo'] (a PDO the caller passed), the Laravel container's
+     * connection by name (core-only installs inside Laravel), the adapter's
+     * query runner. Only plain SELECTs, rate-limited, and skipped inside an
+     * open PostgreSQL transaction — a failed EXPLAIN there would abort the
+     * host's transaction. Returns ExplainParser output or null. Never throws.
+     *
+     * @param string      $sql
+     * @param array       $bindings
+     * @param string|null $connection
+     * @param mixed       $pdo
+     * @return array|null
+     */
+    private function autoExplain($sql, array $bindings, $connection, $pdo)
+    {
+        if (!$this->config->explainQueries || self::$explaining) {
+            return null;
+        }
+        if (stripos(ltrim($sql), 'select') !== 0 || strpos(rtrim($sql, "; \t\n\r"), ';') !== false) {
+            return null;
+        }
+        $now = time();
+        if ($now - $this->explainWindowStart >= 60) {
+            $this->explainWindowStart = $now;
+            $this->explainCount = 0;
+        }
+        if ($this->explainCount >= self::MAX_AUTO_EXPLAINS_PER_MINUTE) {
+            return null;
+        }
+        $this->explainCount++;
+
+        self::$explaining = true;
+        // Each source is tried on its own: a missing Laravel connection name
+        // (e.g. a CI/Yii app that happens to load illuminate) must not stop
+        // the adapter's runner from being used.
+        $explain = null;
+        foreach (array('pdo', 'laravel', 'runner') as $source) {
+            try {
+                if ($source === 'pdo') {
+                    $explain = $pdo instanceof \PDO ? $this->explainWithPdo($pdo, $sql, $bindings) : null;
+                } elseif ($source === 'laravel') {
+                    $explain = $this->explainWithLaravel($sql, $bindings, $connection);
+                } elseif (is_callable($this->queryRunner)) {
+                    $rows = call_user_func($this->queryRunner, 'EXPLAIN ' . $sql, $bindings, true);
+                    if (is_array($rows) && !empty($rows)) {
+                        $explain = ExplainParser::parse(self::sniffExplainDriver($rows), self::rowsToArrays($rows));
+                    }
+                }
+            } catch (\Exception $e) {
+                $explain = null;
+            } catch (\Throwable $e) {
+                $explain = null;
+            }
+            if ($explain !== null) {
+                break;
+            }
+        }
+        self::$explaining = false;
+
+        return $explain;
+    }
+
+    /**
+     * @param \PDO   $pdo
+     * @param string $sql
+     * @param array  $bindings
+     * @return array|null
+     */
+    private function explainWithPdo($pdo, $sql, array $bindings)
+    {
+        $driver = strtolower((string) $pdo->getAttribute(\PDO::ATTR_DRIVER_NAME));
+        $prefix = self::explainPrefix($driver);
+        if ($prefix === null || ($driver === 'pgsql' && $pdo->inTransaction())) {
+            return null;
+        }
+        $values = array();
+        foreach ($bindings as $k => $v) {
+            if ($v instanceof \DateTime || $v instanceof \DateTimeInterface) {
+                $v = $v->format('Y-m-d H:i:s');
+            } elseif (is_bool($v)) {
+                $v = $v ? 1 : 0;
+            } elseif (!is_scalar($v) && $v !== null) {
+                return null;
+            }
+            $values[] = $v;
+        }
+        $stmt = $pdo->prepare($prefix . $sql);
+        if (!$stmt || !$stmt->execute($values)) {
+            return null;
+        }
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
+
+        return is_array($rows) && !empty($rows) ? ExplainParser::parse($driver, $rows) : null;
+    }
+
+    /**
+     * Core-only install inside a Laravel app (manual libs/, a DB::listen in
+     * AppServiceProvider): the container knows the connection by name.
+     *
+     * @param string      $sql
+     * @param array       $bindings
+     * @param string|null $connection
+     * @return array|null
+     */
+    private function explainWithLaravel($sql, array $bindings, $connection)
+    {
+        if (!function_exists('app')) {
+            return null;
+        }
+        $app = app();
+        if (!($app instanceof \Illuminate\Container\Container) || !$app->bound('db')) {
+            return null;
+        }
+        $conn = $app->make('db')->connection($connection !== null && $connection !== '' ? $connection : null);
+        if (!is_object($conn) || !method_exists($conn, 'getDriverName') || !method_exists($conn, 'select')) {
+            return null;
+        }
+        $driver = strtolower((string) $conn->getDriverName());
+        $prefix = self::explainPrefix($driver);
+        if ($prefix === null) {
+            return null;
+        }
+        if ($driver === 'pgsql' && method_exists($conn, 'transactionLevel') && $conn->transactionLevel() > 0) {
+            return null;
+        }
+        $rows = $conn->select($prefix . $sql, $bindings);
+
+        return is_array($rows) && !empty($rows) ? ExplainParser::parse($driver, self::rowsToArrays($rows)) : null;
+    }
+
+    /**
+     * @param string $driver
+     * @return string|null
+     */
+    private static function explainPrefix($driver)
+    {
+        if ($driver === 'sqlite') {
+            return 'EXPLAIN QUERY PLAN ';
+        }
+        if ($driver === 'mysql' || $driver === 'mariadb' || $driver === 'pgsql') {
+            return 'EXPLAIN ';
+        }
+
+        return null;
+    }
+
+    /**
+     * A runner does not say which database it talks to; the EXPLAIN shape does.
+     *
+     * @param array $rows
+     * @return string
+     */
+    private static function sniffExplainDriver(array $rows)
+    {
+        $first = reset($rows);
+        $first = is_object($first) ? (array) $first : $first;
+        if (is_array($first)) {
+            if (array_key_exists('QUERY PLAN', $first)) {
+                return 'pgsql';
+            }
+            if (array_key_exists('detail', $first) && !array_key_exists('select_type', $first)) {
+                return 'sqlite';
+            }
+        }
+
+        return 'mysql';
+    }
+
+    /**
+     * @param array $rows
+     * @return array
+     */
+    private static function rowsToArrays(array $rows)
+    {
+        $out = array();
+        foreach ($rows as $r) {
+            if (is_array($r)) {
+                $out[] = $r;
+            } elseif (is_object($r)) {
+                $out[] = (array) $r;
+            }
+        }
+
+        return $out;
+    }
+
+    public function setQueryRunner($runner)
+    {
+        if (!is_callable($runner)) {
+            return;
+        }
+        $this->queryRunner = $runner;
+
+        // Poll AFTER the response is delivered, so a waiting test costs the end
+        // user nothing. Registered here — not on capture — because the point of
+        // a test is to run when the query is no longer slow and nothing else
+        // would trigger a flush.
+        if ($this->config->isUsable() && $this->config->allowQueryTest) {
+            $self = $this;
+            register_shutdown_function(function () use ($self) {
+                $self->checkQueryTests();
+            });
+        }
+    }
+
+    /**
+     * At most one poll per POLL_SECONDS across the whole application, tracked by
+     * a temp-file mtime. Without this every request would add an HTTP GET.
+     *
+     * @return bool
+     */
+    private function shouldPollForTests()
+    {
+        try {
+            if (!function_exists('sys_get_temp_dir')) {
+                return false;
+            }
+            $dir = @sys_get_temp_dir();
+            if (!is_string($dir) || $dir === '' || !@is_dir($dir) || !@is_writable($dir)) {
+                return false;
+            }
+            $marker = rtrim($dir, '/\\') . '/zanbug-test-' . md5($this->config->apiKey . '|' . $this->config->host);
+
+            if (@is_file($marker) && (time() - (int) @filemtime($marker)) < self::TEST_POLL_SECONDS) {
+                return false;
+            }
+            @file_put_contents($marker, (string) time());
+
+            return true;
+        } catch (\Exception $e) {
+            return false;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Ask Zanbug whether a query test is waiting; if so run it and report back.
+     *
+     * Deliberately does nothing unless the app opted in AND an adapter supplied
+     * a runner. Runs at most once per process and never throws, so wiring it
+     * into a request lifecycle cannot hurt the host application.
+     *
+     * @return void
+     */
+    public function checkQueryTests()
+    {
+        if ($this->testChecked || !$this->config->isUsable()
+            || !$this->config->allowQueryTest || !is_callable($this->queryRunner)) {
+            return;
+        }
+        $this->testChecked = true;
+
+        if (!$this->shouldPollForTests()) {
+            return;
+        }
+
+        try {
+            $response = $this->transport->fetch($this->config->pendingTestsUrl(), $this->config->apiKey);
+            if (!is_array($response) || empty($response['test']) || !is_array($response['test'])) {
+                return;
+            }
+
+            $test = $response['test'];
+            $id = isset($test['id']) ? (int) $test['id'] : 0;
+            $sql = isset($test['sql']) ? (string) $test['sql'] : '';
+            $bindings = (isset($test['bindings']) && is_array($test['bindings'])) ? $test['bindings'] : array();
+            if ($id < 1) {
+                return;
+            }
+
+            $result = QueryTester::run($this->queryRunner, $sql, $bindings);
+
+            // Only timing and a row COUNT go back. Result rows never leave the
+            // customer's server — that is the whole point of running it here.
+            $this->sendOne($this->config->testResultUrl($id), array(
+                'duration_ms' => isset($result['duration_ms']) ? $result['duration_ms'] : null,
+                'rows'        => isset($result['rows']) ? $result['rows'] : null,
+                'error'       => isset($result['error']) ? $result['error'] : null,
+            ));
+        } catch (\Exception $e) {
+            // A monitoring feature must never break the app.
+        } catch (\Throwable $e) {
+            // Same for PHP 7+ engine errors.
+        }
+    }
+
+    private function flushQueue()
+    {
+        // Detach first so a re-entrant capture during send can't cause a double-send.
+        $items = $this->queue;
+        $this->queue = array();
+        foreach ($items as $item) {
+            $this->sendOne($item['url'], $item['payload']);
+        }
+
+        // Slow-query rows go out as ONE batched POST (server caps at 50 rows).
+        $rows = $this->queries;
+        $this->queries = array();
+        if (!empty($rows) && PHP_SAPI !== 'cli' && is_array($this->who) && empty($this->who['user'])) {
+            // The first slow query may have run before the app authenticated
+            // (middleware, boot); by now the guard is warm — look again.
+            $this->who = null;
+        }
+        if (!empty($rows)) {
+            $this->sendOne($this->config->queriesUrl(), array('queries' => $this->attachWho(array_slice($rows, 0, 50))));
+        }
+        // A long-lived worker may serve another request (and user) next.
+        $this->who = null;
+    }
+
+    /**
+     * Slow-query rows: web rows get the signed-in user, the browser's user agent
+     * and the visitor IP; CLI rows the OS user and hostname — so the panel can
+     * tell WHO hit the slow page / ran the slow command. Resolved once per request,
+     * at flush time (after the app has authenticated), never while a query is
+     * being recorded — the auth lookup may itself query the database.
+     *
+     * @param array $rows
+     * @return array
+     */
+    private function attachWho(array $rows)
+    {
+        if (PHP_SAPI === 'cli') {
+            // Cron / queue / artisan: no browser, but the OS account and the
+            // machine still answer "who ran it" (root vs www-data, which box).
+            $who = $this->cliWho();
+            if (empty($who)) {
+                return $rows;
+            }
+            foreach ($rows as $i => $row) {
+                $rows[$i] = array_merge($row, $who);
+            }
+            return $rows;
+        }
+        $who = $this->requestWho();
+        if (empty($who)) {
+            return $rows;
+        }
+        foreach ($rows as $i => $row) {
+            if (!isset($row['command'])) {
+                $rows[$i] = array_merge($row, $who);
+            }
+        }
+        return $rows;
+    }
+
+    /** @return array ('os_user' => string, 'host' => string), either may be absent */
+    private function cliWho()
+    {
+        if ($this->who !== null) {
+            return $this->who;
+        }
+        $this->who = array();
+        try {
+            $name = null;
+            if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+                $pw = @posix_getpwuid(posix_geteuid());
+                if (is_array($pw) && !empty($pw['name'])) {
+                    $name = $pw['name'];
+                }
+            }
+            if (empty($name)) {
+                $env = getenv('USER');
+                $name = $env ? $env : (function_exists('get_current_user') ? @get_current_user() : null);
+            }
+            if (is_string($name) && $name !== '') {
+                $this->who['os_user'] = substr($name, 0, 64);
+            }
+            $host = function_exists('gethostname') ? @gethostname() : null;
+            if (is_string($host) && $host !== '') {
+                $this->who['host'] = substr($host, 0, 120);
+            }
+        } catch (\Exception $e) {
+            // non-fatal
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+        return $this->who;
+    }
+
+    /**
+     * Visitor IP for a web request. Cloudflare's header is set by the edge and
+     * can't be forged past it; X-Forwarded-For's first hop is the client when a
+     * proxy sits in front; REMOTE_ADDR otherwise.
+     *
+     * @return string|null
+     */
+    private function requestIp()
+    {
+        foreach (array('HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR') as $key) {
+            if (empty($_SERVER[$key]) || !is_string($_SERVER[$key])) {
+                continue;
+            }
+            $parts = explode(',', $_SERVER[$key]);
+            $ip = trim($parts[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+        return null;
+    }
+
+    /** @return array ('user' => array, 'user_agent' => string, 'ip' => string), any may be absent */
+    private function requestWho()
+    {
+        if ($this->who !== null) {
+            return $this->who;
+        }
+        $this->who = array();
+        $this->resolvingWho = true;
+        try {
+            $user = $this->user;
+            $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : null;
+            if (is_callable($this->config->contextResolver)) {
+                $resolved = call_user_func($this->config->contextResolver);
+                if (is_array($resolved)) {
+                    if (!empty($resolved['user']) && is_array($resolved['user'])) {
+                        $user = $resolved['user'];
+                    }
+                    if (empty($ua) && isset($resolved['request']['user_agent'])) {
+                        $ua = $resolved['request']['user_agent'];
+                    }
+                }
+            }
+            // User agent and IP are written FIRST, before the (heavier) user
+            // resolution, so that even if autoUser() ever throws, the request
+            // context is never lost — a browser request always answers "who"
+            // with at least its user agent and IP.
+            if (is_string($ua) && $ua !== '') {
+                $this->who['user_agent'] = substr($ua, 0, 300);
+            }
+            $ip = $this->requestIp();
+            if ($ip !== null) {
+                $this->who['ip'] = $ip;
+            }
+            if (empty($user)) {
+                $user = $this->autoUser();
+            }
+            if (is_array($user)) {
+                $clean = array();
+                // The unified actor contract: id/email/name/guard identify the
+                // actor; username and type (user|admin|guest|system) let an
+                // adapter or resolver be explicit — the panel still infers type
+                // from the guard when they are absent.
+                foreach (array('id', 'email', 'name', 'username', 'type', 'guard') as $k) {
+                    if (isset($user[$k]) && is_scalar($user[$k]) && (string) $user[$k] !== '') {
+                        $clean[$k] = substr((string) $user[$k], 0, 120);
+                    }
+                }
+                if (!empty($clean)) {
+                    $this->who['user'] = $clean;
+                }
+            }
+        } catch (\Exception $e) {
+            // non-fatal
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+        $this->resolvingWho = false;
+        return $this->who;
+    }
+
+    /**
+     * Single transport send, fully guarded — the client app must NEVER get an exception.
+     */
+    private function sendOne($url, array $payload)
+    {
+        try {
+            $this->transport->send($url, $this->config->apiKey, $payload);
+        } catch (\Exception $e) {
+            // Telemetry must be non-fatal.
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    private function collectContext()
+    {
+        $ctx = array('request' => null, 'session' => null, 'user' => $this->user, 'context' => array());
+
+        if (is_callable($this->config->contextResolver)) {
+            $resolved = call_user_func($this->config->contextResolver);
+            if (is_array($resolved)) {
+                foreach (array('request', 'session', 'user', 'context') as $k) {
+                    if (isset($resolved[$k]) && $resolved[$k] !== null) {
+                        $ctx[$k] = $resolved[$k];
+                    }
+                }
+                if (empty($ctx['user'])) {
+                    $ctx['user'] = $this->autoUser();
+                }
+                return $ctx;
+            }
+        }
+
+        // User first: resolving it can set up the framework's session (e.g.
+        // Yii's custom session name), which the cookie redaction then sees.
+        if (empty($ctx['user'])) {
+            $ctx['user'] = $this->autoUser();
+        }
+        $ctx['request'] = $this->collector->request();
+        $ctx['session'] = $this->collector->session();
+        return $ctx;
+    }
+
+    private function shouldSample()
+    {
+        if ($this->config->sampleRate >= 1.0) {
+            return true;
+        }
+        return (mt_rand() / mt_getrandmax()) <= $this->config->sampleRate;
+    }
+}
