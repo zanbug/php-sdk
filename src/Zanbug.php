@@ -12,7 +12,7 @@ use Zanbug\Sdk\Support\Updater;
 class Zanbug
 {
     /** SDK version (sent with the one-time install ping). */
-    const VERSION = '2.0.4';
+    const VERSION = '2.0.5';
 
     /** @var Client|null */
     private static $client = null;

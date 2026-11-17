@@ -2,6 +2,7 @@
 
 namespace Zanbug\Sdk\Transport;
 
+use Zanbug\Sdk\Support\CircuitBreaker;
 use Zanbug\Sdk\Support\Compat;
 
 /**
@@ -13,10 +14,37 @@ class StreamTransport implements Transport
 {
     /** @var int */
     private $timeout;
+    /** @var CircuitBreaker|null */
+    private $breaker;
 
     public function __construct($timeout = 3)
     {
         $this->timeout = (int) $timeout;
+    }
+
+    private function breaker($url)
+    {
+        if ($this->breaker === null) {
+            $this->breaker = new CircuitBreaker($url);
+        }
+        return $this->breaker;
+    }
+
+    /**
+     * @param mixed      $body result of file_get_contents
+     * @param array|null $hdrs the $http_response_header of that call
+     */
+    private function record($body, $hdrs)
+    {
+        $code = 0;
+        if (is_array($hdrs) && isset($hdrs[0]) && preg_match('#\s(\d{3})\b#', $hdrs[0], $m)) {
+            $code = (int) $m[1];
+        }
+        if ($body === false || $code === 0 || $code >= 500) {
+            $this->breaker->failure();
+        } else {
+            $this->breaker->success();
+        }
     }
 
     public function send($url, $apiKey, array $payload)
@@ -25,6 +53,10 @@ class StreamTransport implements Transport
             $body = json_encode($payload, Compat::jsonFlags());
             if ($body === false) {
                 return;
+            }
+
+            if (!$this->breaker($url)->allow()) {
+                return; // Zanbug is down — skip instantly
             }
 
             $headers = "Content-Type: application/json\r\n"
@@ -46,7 +78,9 @@ class StreamTransport implements Transport
                 ),
             ));
 
-            @file_get_contents($url, false, $context);
+            $http_response_header = null;
+            $res = @file_get_contents($url, false, $context);
+            $this->record($res, $http_response_header);
         } catch (\Exception $e) {
             // non-fatal
         } catch (\Throwable $e) {
@@ -62,6 +96,10 @@ class StreamTransport implements Transport
     public function fetch($url, $apiKey)
     {
         try {
+            if (!$this->breaker($url)->allow()) {
+                return null;
+            }
+
             $context = stream_context_create(array('http' => array(
                 'method'        => 'GET',
                 'header'        => "Accept: application/json\r\n"
@@ -70,7 +108,9 @@ class StreamTransport implements Transport
                 'timeout'       => $this->timeout,
                 'ignore_errors' => true,
             )));
+            $http_response_header = null;
             $body = @file_get_contents($url, false, $context);
+            $this->record($body, $http_response_header);
             if (!is_string($body) || $body === '') {
                 return null;
             }

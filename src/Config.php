@@ -65,7 +65,7 @@ class Config
         $this->environment = (string) (isset($c['environment']) && $c['environment'] ? $c['environment'] : 'production');
         $this->release = isset($c['release']) ? $c['release'] : null;
         $this->enabled = isset($c['enabled']) ? (bool) $c['enabled'] : true;
-        $this->timeout = isset($c['timeout']) ? (int) $c['timeout'] : 3;
+        $this->timeout = isset($c['timeout']) ? (int) $c['timeout'] : 2;
         $this->sampleRate = isset($c['sample_rate']) ? (float) $c['sample_rate'] : 1.0;
         $this->captureRequests = isset($c['capture_requests']) ? (bool) $c['capture_requests'] : false;
         // Universal audit ("who did it"): default ON so every project captures the

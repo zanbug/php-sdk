@@ -1,5 +1,10 @@
 # Changelog — zanbug/php-sdk
 
+## 2.0.5 — 2026-11-17
+
+- **Circuit breaker**: Zanbug serveri əlçatmaz olanda (söndürülüb, ödəniş, şəbəkə) SDK artıq hər request-də timeout gözləmir. Uğursuz göndərişdən sonra 30 san (təkrar uğursuzluqda 60, 120 … maks. 10 dəq) bütün göndərişlər dərhal atlanır; sonra yalnız 1 "probe" buraxılır, uğurlu olsa breaker bağlanır. Vəziyyət `sys_get_temp_dir()`-də paylaşılır (bütün FPM worker-lər üçün). Əvvəl: ölü serverdə hər göndəriş 3 san, növbədə N hadisə = N×3 san worker tutulurdu və host layihə yavaşlayırdı.
+- Default `timeout` 3 → 2 san, connect timeout 1 san.
+
 ## 2.0.4 — 2026-10-15
 
 - Manual (`libs/`) auto-update **ext-zip olmayan serverdə** də işləyir: əvvəl `ZipArchive` yoxdursa yeniləmə hər gün "ext-zip is missing" ilə dayanırdı (166cargo #37). İndi sıra: ext-zip → `.zip`; yoxdursa `PharData` (ext-phar + zlib) → `.tar.gz`; o da yoxdursa `tar` əmri.
