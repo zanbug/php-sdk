@@ -1,5 +1,9 @@
 # Changelog — zanbug/php-sdk
 
+## 2.0.6 — 2026-11-17
+
+- Manual (`libs/`) auto-update **`/tmp` ayrı fayl sistemində olan serverdə** işləyir: yeni `src/` `sys_get_temp_dir()`-dən `rename()` ilə köçürülürdü, qovluq üçün cross-device rename uğursuz olurdu və yeniləmə hər dəfə "could not move the new src/ into place; old version restored" ilə geri qaytarılırdı (tmpfs, ayrı mount, PrivateTmp). İndi `rename()` alınmasa kopyala + sil ehtiyat yolu işləyir; kopya yarımçıq qalarsa heç nə qalmır. Adapterlər (`libs/zanbug-laravel` …) üçün də eyni.
+
 ## 2.0.5 — 2026-11-17
 
 - **Circuit breaker**: Zanbug serveri əlçatmaz olanda (söndürülüb, ödəniş, şəbəkə) SDK artıq hər request-də timeout gözləmir. Uğursuz göndərişdən sonra 30 san (təkrar uğursuzluqda 60, 120 … maks. 10 dəq) bütün göndərişlər dərhal atlanır; sonra yalnız 1 "probe" buraxılır, uğurlu olsa breaker bağlanır. Vəziyyət `sys_get_temp_dir()`-də paylaşılır (bütün FPM worker-lər üçün). Əvvəl: ölü serverdə hər göndəriş 3 san, növbədə N hadisə = N×3 san worker tutulurdu və host layihə yavaşlayırdı.

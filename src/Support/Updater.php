@@ -561,7 +561,8 @@ class Updater
 
             return $res;
         }
-        if (!@rename($src . '/src', $root . '/src')) {
+        if (!self::moveDir($src . '/src', $root . '/src')) {
+            self::rmdir($root . '/src');
             @rename($backup, $root . '/src');
             self::rmdir($tmp);
             $res['message'] = 'could not move the new src/ into place; old version restored';
@@ -634,17 +635,18 @@ class Updater
                 $backup = $root . '/src.bak-' . Zanbug::VERSION;
                 self::rmdir($backup);
                 if (@rename($root . '/src', $backup)) {
-                    if (@rename($src . '/src', $root . '/src')) {
+                    if (self::moveDir($src . '/src', $root . '/src')) {
                         foreach (array('config', 'composer.json', 'README.md') as $f) {
                             if (is_dir($src . '/' . $f)) {
                                 self::rmdir($root . '/' . $f);
-                                @rename($src . '/' . $f, $root . '/' . $f);
+                                self::moveDir($src . '/' . $f, $root . '/' . $f);
                             } elseif (is_file($src . '/' . $f)) {
                                 @copy($src . '/' . $f, $root . '/' . $f);
                             }
                         }
                         $out[] = $dir;
                     } else {
+                        self::rmdir($root . '/src');
                         @rename($backup, $root . '/src');
                     }
                 }
@@ -788,6 +790,52 @@ class Updater
         }
 
         return null;
+    }
+
+    /**
+     * Move a directory. rename() is atomic but fails with "Invalid cross-device
+     * link" when the source (sys_get_temp_dir(): often a tmpfs / separate mount /
+     * systemd PrivateTmp) is on another filesystem than the target — so fall back
+     * to copy + delete. A failed copy leaves nothing half-written at $to.
+     *
+     * @return bool
+     */
+    private static function moveDir($from, $to)
+    {
+        if (@rename($from, $to)) {
+            return true;
+        }
+        if (!self::copyDir($from, $to)) {
+            self::rmdir($to);
+
+            return false;
+        }
+        self::rmdir($from);
+
+        return true;
+    }
+
+    private static function copyDir($from, $to)
+    {
+        if (!is_dir($from) || (!is_dir($to) && !@mkdir($to, 0755, true))) {
+            return false;
+        }
+        foreach ((array) @scandir($from) as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $s = $from . '/' . $entry;
+            $d = $to . '/' . $entry;
+            if (is_dir($s) && !is_link($s)) {
+                if (!self::copyDir($s, $d)) {
+                    return false;
+                }
+            } elseif (!@copy($s, $d)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function rmdir($dir)
